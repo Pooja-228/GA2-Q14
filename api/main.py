@@ -1,57 +1,86 @@
-# api/main.py
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-import numpy as np
 import json
-from pathlib import Path
+import os
+import math
 
-app = FastAPI()
+# Load telemetry data once (cold start)
+DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "telemetry.json")
 
-# Enable CORS for POST requests from any origin
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["POST"],
-    allow_headers=["*"]
-)
+with open(DATA_PATH, "r") as f:
+    TELEMETRY = json.load(f)
 
-# Load telemetry JSON once at startup
-BASE_DIR = Path(__file__).parent
-with open(BASE_DIR / "telemetry.json") as f:
-    telemetry_data = json.load(f)
 
-@app.post("/api/latency")
-async def compute_metrics(req: Request):
+def percentile(values, p):
+    if not values:
+        return None
+    values = sorted(values)
+    k = (len(values) - 1) * (p / 100)
+    f = math.floor(k)
+    c = math.ceil(k)
+
+    if f == c:
+        return values[int(k)]
+
+    return values[f] + (values[c] - values[f]) * (k - f)
+
+
+def handler(request):
+    # Enable CORS
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Content-Type": "application/json"
+    }
+
+    # Handle preflight
+    if request.method == "OPTIONS":
+        return ("", 200, headers)
+
+    if request.method != "POST":
+        return (
+            json.dumps({"error": "Only POST allowed"}),
+            405,
+            headers
+        )
+
     try:
-        body = await req.json()
+        body = request.get_json()
         regions = body.get("regions", [])
-        threshold = body.get("threshold_ms", 180)
+        threshold = body.get("threshold_ms", 0)
 
-        response = {}
+        result = {}
+
         for region in regions:
-            region_data = [r for r in telemetry_data if r["region"] == region]
-            if not region_data:
-                response[region] = {
-                    "avg_latency": None,
-                    "p95_latency": None,
-                    "avg_uptime": None,
-                    "breaches": 0
-                }
+            records = [r for r in TELEMETRY if r["region"] == region]
+
+            if not records:
                 continue
 
-            latencies = [r["latency_ms"] for r in region_data]
-            uptimes = [r["uptime_pct"] for r in region_data]
-            breaches = sum(1 for r in region_data if r["latency_ms"] > threshold)
+            latencies = [r["latency_ms"] for r in records]
+            uptimes = [r["uptime_pct"] for r in records]
 
-            response[region] = {
-                "avg_latency": float(np.mean(latencies)),
-                "p95_latency": float(np.percentile(latencies, 95)),
-                "avg_uptime": float(np.mean(uptimes)),
+            avg_latency = sum(latencies) / len(latencies)
+            p95_latency = percentile(latencies, 95)
+            avg_uptime = sum(uptimes) / len(uptimes)
+
+            breaches = sum(1 for r in records if r["latency_ms"] > threshold)
+
+            result[region] = {
+                "avg_latency": round(avg_latency, 2),
+                "p95_latency": round(p95_latency, 2),
+                "avg_uptime": round(avg_uptime, 3),
                 "breaches": breaches
             }
 
-        return JSONResponse(content=response)
+        return (
+            json.dumps(result),
+            200,
+            headers
+        )
 
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return (
+            json.dumps({"error": str(e)}),
+            500,
+            headers
+        )
